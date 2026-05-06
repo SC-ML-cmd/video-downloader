@@ -233,7 +233,7 @@ class GenericSpider(BaseSpider):
 
         title_tag = soup.find("title")
         if title_tag and title_tag.text.strip():
-            # 去掉站点后缀 (如 " - 91porn")
+            # 去掉站点后缀
             title = title_tag.text.strip()
             title = re.sub(r"\s*[-|]\s*\w+porn.*$", "", title, flags=re.I)
             return title
