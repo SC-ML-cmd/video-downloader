@@ -221,37 +221,56 @@ class VideoDownloaderGUI:
             # 方案 B: 爬虫 + HTTP 直链
             try:
                 from src.spiders.examples.generic_spider import GenericSpider
+                from src.utils import sanitize_filename
+                from urllib.parse import urlparse
+                from bs4 import BeautifulSoup
+                import re
+
                 spider = GenericSpider()
 
-                video_url = spider.extract_best_video_url(url)
+                # 一次性获取页面，同时提取 URL 和标题
+                self.root.after(0, lambda: self._log("爬虫正在解析网页...", "INFO"))
+                resp = spider.session.get(url, timeout=30,
+                                          proxies={"http": None, "https": None})
+                resp.raise_for_status()
+                html = resp.text
+
+                video_url = spider._decode_strencode(html)
+                if not video_url:
+                    video_url = spider.extract_best_video_url(url)
+
+                # 直接从已获取的 HTML 中提取标题（避免二次请求）
+                soup = BeautifulSoup(html, "html.parser")
+                title = spider._extract_title(soup)
+
                 if not video_url:
                     raise ValueError("爬虫未能提取到视频链接")
 
-                title = spider.extract_title_from_page(url)
-
-                self.root.after(0, lambda u=video_url[:100]: self._log(
+                self.root.after(0, lambda u=video_url[:120]: self._log(
                     f"爬虫发现视频: {u}...", "INFO"))
+                self.root.after(0, lambda t=title: self._log(
+                    f"标题: {t}", "INFO"))
 
                 # 构建 Referer
-                from urllib.parse import urlparse
                 parsed = urlparse(url)
                 referer = f"{parsed.scheme}://{parsed.netloc}/"
-
-                from src.utils import sanitize_filename
                 safe_name = sanitize_filename(title)
 
+                # 用 spider 的 session 下载（复用连接、绕过代理）
+                self.root.after(0, lambda: self._log("开始 HTTP 直链下载...", "INFO"))
                 filepath = download_direct(
                     video_url=video_url,
                     output_dir=output_dir,
                     filename=safe_name,
                     referer=referer,
+                    session=spider.session,
                 )
 
                 # 音轨检测
                 audio_ok = self._check_audio(filepath)
                 self.root.after(0, lambda fp=filepath, ao=audio_ok: self._on_done(fp, ao))
             except Exception as e2:
-                err_detail = f"yt-dlp 和爬虫均失败:\n{str(e2)[:200]}"
+                err_detail = f"yt-dlp 和爬虫均失败:\n{str(e2)[:300]}"
                 self.root.after(0, lambda msg=err_detail: self._log(msg, "ERROR"))
                 self.root.after(0, lambda: self.status_var.set("下载失败"))
                 self.root.after(0, lambda msg=err_detail: messagebox.showerror("下载失败", msg))

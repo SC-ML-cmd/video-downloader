@@ -210,6 +210,7 @@ def download_direct(
     filename: Optional[str] = None,
     referer: Optional[str] = None,
     progress: Optional[DirectDownloadProgress] = None,
+    session: Optional[requests.Session] = None,
 ) -> str:
     """
     直接 HTTP 下载视频（不需要 yt-dlp）。
@@ -220,11 +221,15 @@ def download_direct(
         filename: 自定义文件名（不含扩展名）
         referer: Referer 请求头
         progress: 进度回调
+        session: 复用已有的 requests.Session（保持 cookies/headers）
 
     Returns:
         下载文件路径
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    if session is None:
+        session = requests.Session()
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -238,8 +243,18 @@ def download_direct(
     if progress is None:
         progress = DirectDownloadProgress()
 
-    resp = requests.get(video_url, headers=headers, stream=True, timeout=60)
+    # 绕过系统代理，直连 CDN
+    resp = session.get(video_url, headers=headers, stream=True, timeout=60,
+                       proxies={"http": None, "https": None})
     resp.raise_for_status()
+
+    # 验证响应是视频内容，不是 HTML 错误页
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "text/html" in content_type:
+        raise ValueError(
+            f"CDN 返回了 HTML 页面而非视频 (Content-Type: {content_type})，"
+            f"可能是 token 过期或被拦截。\n前 200 字节: {resp.text[:200]}"
+        )
 
     total = int(resp.headers.get("Content-Length", 0))
 
@@ -269,11 +284,23 @@ def download_direct(
     start_time = time.time()
     with open(filepath, "wb") as f:
         for chunk in resp.iter_content(chunk_size=65536):
-            f.write(chunk)
-            downloaded += len(chunk)
-            elapsed = time.time() - start_time
-            speed = downloaded / elapsed if elapsed > 0 else 0
-            progress.update(downloaded, total, speed)
+            if chunk:  # 过滤空 chunk（keep-alive）
+                f.write(chunk)
+                downloaded += len(chunk)
+                elapsed = time.time() - start_time
+                speed = downloaded / elapsed if elapsed > 0 else 0
+                progress.update(downloaded, total, speed)
 
     progress.done()
+
+    # 验证下载结果
+    actual_size = filepath.stat().st_size
+    if actual_size == 0:
+        filepath.unlink()
+        raise ValueError("下载的文件大小为 0，CDN 返回了空内容")
+    if total > 0 and actual_size < total * 0.8:
+        filepath.unlink()
+        raise ValueError(
+            f"下载不完整: 预期 {total} bytes，实际 {actual_size} bytes")
+
     return str(filepath)

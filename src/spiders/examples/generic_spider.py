@@ -140,22 +140,30 @@ class GenericSpider(BaseSpider):
         self, url: str, output_dir: str, filename: Optional[str] = None
     ) -> str:
         """
-        从页面提取视频 URL 并直接下载。
+        从页面提取视频 URL 并直接下载（仅一次 HTTP 请求解析页面）。
 
         自动处理 strencode2 解码、Referer 头等。
         """
-        video_url = self.extract_best_video_url(url)
+        # 一次请求获取页面 HTML
+        resp = self.session.get(url, timeout=30,
+                                proxies={"http": None, "https": None})
+        resp.raise_for_status()
+        html = resp.text
+
+        # 从同一份 HTML 中提取视频 URL 和标题
+        video_url = self._decode_strencode(html)
+        if not video_url:
+            video_url = self.extract_best_video_url(url)
+
         if not video_url:
             raise ValueError(f"未能从页面提取到视频链接: {url}")
 
-        # 提取标题
-        title = self.extract_title_from_page(url)
+        soup = BeautifulSoup(html, "html.parser")
+        title = self._extract_title(soup)
 
         if filename is None:
             filename = sanitize_filename(title)
 
-        # 确定 Referer
-        referer = url
         parsed = urllib.parse.urlparse(url)
         referer = f"{parsed.scheme}://{parsed.netloc}/"
 
@@ -169,6 +177,7 @@ class GenericSpider(BaseSpider):
             filename=filename,
             referer=referer,
             progress=progress,
+            session=self.session,
         )
         return filepath
 

@@ -254,6 +254,7 @@ def cmd_spider(args):
                     filename=filename,
                     referer=referer,
                     progress=progress,
+                    session=spider.session,
                 )
                 print(f"\n{Fore.GREEN}下载完成: {filepath}{Style.RESET_ALL}")
                 _check_audio(filepath)
