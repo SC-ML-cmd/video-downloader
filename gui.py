@@ -1,16 +1,14 @@
 """通用网页视频下载器 GUI — 基于 tkinter 的简洁图形界面"""
-import json
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 from pathlib import Path
 
-# 将 src 加入路径
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.analyzer import analyze_video
-from src.downloader import download_video, DownloadProgress
+from src.downloader import download_video, download_direct, DownloadProgress
 from src.utils import load_config
 
 
@@ -23,12 +21,12 @@ class VideoDownloaderGUI:
 
         self.config = load_config()
         self.current_info = None
+        self.current_video_url = None  # 爬虫提取到的直链 URL
 
         self._build_ui()
         self._center_window()
 
     def _build_ui(self):
-        # 主框架
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -44,6 +42,10 @@ class VideoDownloaderGUI:
                    command=self._do_analyze).pack(side=tk.LEFT, padx=2)
         ttk.Button(url_frame, text="下载",
                    command=self._do_download).pack(side=tk.LEFT, padx=2)
+
+        # 下载模式提示
+        ttk.Label(main_frame, text="支持 yt-dlp 引擎 + 爬虫直链下载，yt-dlp 失败时自动切换",
+                  foreground="gray").pack(anchor=tk.W, pady=(0, 5))
 
         # 控制面板
         ctrl_frame = ttk.Frame(main_frame)
@@ -67,7 +69,7 @@ class VideoDownloaderGUI:
                                      width=8, state="readonly")
         quality_combo.pack(side=tk.LEFT, padx=5)
 
-        # 信息展示 + 进度 笔记本
+        # 笔记本
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -112,6 +114,8 @@ class VideoDownloaderGUI:
         self.log_text.insert(tk.END, f"[{tag}] {msg}\n")
         self.log_text.see(tk.END)
 
+    # ===== 分析 =====
+
     def _do_analyze(self):
         url = self.url_var.get().strip()
         if not url:
@@ -125,26 +129,62 @@ class VideoDownloaderGUI:
 
         def _run():
             try:
+                # 先尝试 yt-dlp
                 info = analyze_video(url)
                 self.current_info = info
-                self.root.after(0, lambda: self._show_info(info))
-                self.root.after(0, lambda: self.status_var.set("分析完成"))
+                self.current_video_url = None
+                summary = info.get_summary()
+                self.root.after(0, lambda s=summary: self._show_info(s))
+                self.root.after(0, lambda: self._log("yt-dlp 分析成功", "OK"))
+                self.root.after(0, lambda: self.status_var.set("分析完成 (yt-dlp)"))
             except Exception as e:
-                self.root.after(0, lambda: self._show_error(str(e)))
+                ytdlp_err = str(e)[:80]
+                self.root.after(0, lambda msg=ytdlp_err: self._log(
+                    f"yt-dlp 分析失败: {msg}，切换到爬虫...", "WARN"))
+                # 降级到爬虫
+                try:
+                    from src.spiders.examples.generic_spider import GenericSpider
+                    spider = GenericSpider()
+                    spider_info = spider.extract_info(url)
+                    self.current_video_url = spider.extract_best_video_url(url)
+
+                    lines = [
+                        "=" * 50,
+                        f"  标题: {spider_info['title']}",
+                        f"  来源: 爬虫引擎 (yt-dlp 不支持此网站)",
+                        "=" * 50,
+                        f"  流媒体链接: {len(spider_info['streams'])} 个",
+                    ]
+                    for i, s in enumerate(spider_info["streams"]):
+                        priority = s.get("priority", "normal")
+                        tag = "[优先]" if priority == "high" else "[备用]"
+                        lines.append(f"  {i+1}. {tag} {s['url'][:100]}...")
+
+                    summary = "\n".join(lines)
+                    stream_count = len(spider_info["streams"])
+                    self.root.after(0, lambda s=summary: self._show_info(s))
+                    self.root.after(0, lambda c=stream_count: self._log(
+                        f"爬虫发现 {c} 个视频流", "OK"))
+                    self.root.after(0, lambda: self.status_var.set("分析完成 (爬虫)"))
+                except Exception as e2:
+                    err_detail = f"分析失败:\nyt-dlp: {ytdlp_err}\n爬虫: {str(e2)[:100]}"
+                    self.root.after(0, lambda msg=err_detail: self._show_error(msg))
             finally:
                 self.root.after(0, self.progress.stop)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _show_info(self, info):
+    def _show_info(self, text: str):
         self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(1.0, info.get_summary())
+        self.info_text.insert(1.0, text)
 
     def _show_error(self, msg: str):
         self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(1.0, f"错误: {msg}")
+        self.info_text.insert(1.0, f"错误:\n{msg}")
         self.status_var.set("分析失败")
         self._log(msg, "ERROR")
+
+    # ===== 下载 =====
 
     def _do_download(self):
         url = self.url_var.get().strip()
@@ -159,34 +199,94 @@ class VideoDownloaderGUI:
         self.progress["mode"] = "indeterminate"
         self.progress.start()
 
-        progress = DownloadProgress()
-
         def _run():
+            # 方案 A: yt-dlp
             try:
+                self.root.after(0, lambda: self._log("尝试 yt-dlp 下载..."))
                 result = download_video(
-                    url=url,
-                    output_dir=output_dir,
-                    quality=quality,
-                    progress_hook=progress.progress_hook,
+                    url=url, output_dir=output_dir, quality=quality,
+                    progress_hook=DownloadProgress().progress_hook,
                 )
-                filename = ""
+                filepath = ""
                 rd = result.get("requested_downloads", [{}])
                 if rd:
-                    filename = rd[0].get("filepath", "")
-                msg = f"下载完成: {filename}" if filename else "下载完成"
-                self.root.after(0, lambda: self._log(msg))
-                self.root.after(0, lambda: self.status_var.set("下载完成"))
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "完成", f"视频下载完成!\n{filename}"))
+                    filepath = rd[0].get("filepath", "")
+                self.root.after(0, lambda fp=filepath: self._on_done(fp))
+                return
             except Exception as e:
-                self.root.after(0, lambda: self._log(str(e), "ERROR"))
+                ytdlp_err = str(e)[:80]
+                self.root.after(0, lambda msg=ytdlp_err: self._log(
+                    f"yt-dlp 失败: {msg}，切换到爬虫引擎...", "WARN"))
+
+            # 方案 B: 爬虫 + HTTP 直链
+            try:
+                from src.spiders.examples.generic_spider import GenericSpider
+                spider = GenericSpider()
+
+                video_url = spider.extract_best_video_url(url)
+                if not video_url:
+                    raise ValueError("爬虫未能提取到视频链接")
+
+                title = spider.extract_title_from_page(url)
+
+                self.root.after(0, lambda u=video_url[:100]: self._log(
+                    f"爬虫发现视频: {u}...", "INFO"))
+
+                # 构建 Referer
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                referer = f"{parsed.scheme}://{parsed.netloc}/"
+
+                from src.utils import sanitize_filename
+                safe_name = sanitize_filename(title)
+
+                filepath = download_direct(
+                    video_url=video_url,
+                    output_dir=output_dir,
+                    filename=safe_name,
+                    referer=referer,
+                )
+
+                # 音轨检测
+                audio_ok = self._check_audio(filepath)
+                self.root.after(0, lambda fp=filepath, ao=audio_ok: self._on_done(fp, ao))
+            except Exception as e2:
+                err_detail = f"yt-dlp 和爬虫均失败:\n{str(e2)[:200]}"
+                self.root.after(0, lambda msg=err_detail: self._log(msg, "ERROR"))
                 self.root.after(0, lambda: self.status_var.set("下载失败"))
-                self.root.after(0, lambda: messagebox.showerror(
-                    "下载失败", str(e)))
+                self.root.after(0, lambda msg=err_detail: messagebox.showerror("下载失败", msg))
             finally:
                 self.root.after(0, self.progress.stop)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _on_done(self, filepath: str, has_audio: bool = True):
+        short = Path(filepath).name if filepath else "未知"
+        self._log(f"下载完成: {short}")
+        audio_tag = " 有音轨" if has_audio else " 无声!"
+        self.status_var.set(f"下载完成{audio_tag}")
+        self.progress.stop()
+        messagebox.showinfo("完成", f"视频下载完成!\n{filepath}")
+
+    def _check_audio(self, filepath: str) -> bool:
+        """检查是否有音频轨道"""
+        import subprocess
+        import json
+        from src.utils import find_ffmpeg
+        try:
+            ffmpeg = find_ffmpeg()
+            if ffmpeg:
+                ffprobe = str(Path(ffmpeg).parent / "ffprobe.exe")
+                r = subprocess.run(
+                    [ffprobe, "-v", "quiet", "-print_format", "json",
+                     "-show_streams", filepath],
+                    capture_output=True, text=True
+                )
+                streams = json.loads(r.stdout).get("streams", [])
+                return any(s.get("codec_type") == "audio" for s in streams)
+        except Exception:
+            pass
+        return True  # 检测失败时不报错
 
     def run(self):
         self.root.mainloop()
