@@ -6,6 +6,14 @@ import time
 from pathlib import Path
 from typing import Optional, Callable
 
+# Windows 控制台 UTF-8 编码
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import requests
 import yt_dlp
 
@@ -29,7 +37,7 @@ class DownloadProgress:
                 eta_str = self._fmt_eta(eta) if eta else "N/A"
                 bar_len = 30
                 filled = int(bar_len * percent / 100)
-                bar = "█" * filled + "░" * (bar_len - filled)
+                bar = "#" * filled + "-" * (bar_len - filled)
                 print(f"\r[{self.label}] {bar} {percent:5.1f}% "
                       f"| {speed_str} | ETA: {eta_str}", end="")
                 sys.stdout.flush()
@@ -176,7 +184,7 @@ class DirectDownloadProgress:
             percent = downloaded / total * 100
             bar_len = 30
             filled = int(bar_len * percent / 100)
-            bar = "█" * filled + "░" * (bar_len - filled)
+            bar = "#" * filled + "-" * (bar_len - filled)
 
             if speed > 1_000_000:
                 speed_str = f"{speed / 1_000_000:.1f} MB/s"
@@ -248,15 +256,19 @@ def download_direct(
                        proxies={"http": None, "https": None})
     resp.raise_for_status()
 
-    # 验证响应是视频内容，不是 HTML 错误页
+    # 诊断信息
     content_type = resp.headers.get("Content-Type", "").lower()
-    if "text/html" in content_type:
-        raise ValueError(
-            f"CDN 返回了 HTML 页面而非视频 (Content-Type: {content_type})，"
-            f"可能是 token 过期或被拦截。\n前 200 字节: {resp.text[:200]}"
-        )
-
     total = int(resp.headers.get("Content-Length", 0))
+    print(f"[诊断] HTTP {resp.status_code} | Content-Type: {content_type} "
+          f"| Content-Length: {total} ({total/1024/1024:.1f} MB)")
+
+    # 验证响应是视频内容，不是 HTML 错误页
+    if "text/html" in content_type:
+        preview = resp.text[:300]
+        print(f"[诊断] HTML 错误页预览: {preview}")
+        raise ValueError(
+            f"CDN 返回了 HTML 页面而非视频，可能是 token 过期或被拦截。"
+        )
 
     # 从 URL 或 Content-Disposition 推断扩展名
     ext = ".mp4"
@@ -292,12 +304,18 @@ def download_direct(
                 progress.update(downloaded, total, speed)
 
     progress.done()
+    print(f"[诊断] 实际下载: {downloaded} bytes ({downloaded/1024/1024:.1f} MB)")
 
     # 验证下载结果
     actual_size = filepath.stat().st_size
     if actual_size == 0:
         filepath.unlink()
-        raise ValueError("下载的文件大小为 0，CDN 返回了空内容")
+        raise ValueError("下载的文件大小为 0 bytes，CDN 返回了空内容。"
+                         "请检查视频链接是否有效。")
+    if actual_size < 10240:
+        filepath.unlink()
+        raise ValueError(f"下载的文件极小 ({actual_size} bytes)，"
+                         "不是有效的视频文件，已删除。")
     if total > 0 and actual_size < total * 0.8:
         filepath.unlink()
         raise ValueError(
